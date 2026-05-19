@@ -7,6 +7,7 @@ use aya_ebpf::{
     maps::{HashMap, PerCpuArray, RingBuf},
     programs::{ProbeContext, RetProbeContext},
 };
+use aya_log_ebpf::info;
 
 use dirt_common::{Event, EventType, ShareName};
 
@@ -27,6 +28,7 @@ static mut SHARE_SCRATCH: PerCpuArray<ShareName> = PerCpuArray::with_max_entries
 
 #[uprobe]
 pub fn uprobe_unlink(ctx: ProbeContext) -> u32 {
+    info!(&ctx, "uprobe_unlink called");
     match try_uprobe_handler(ctx, EventType::Unlink) {
         Ok(ret) => ret,
         Err(ret) => ret,
@@ -35,6 +37,7 @@ pub fn uprobe_unlink(ctx: ProbeContext) -> u32 {
 
 #[uprobe]
 pub fn uprobe_create(ctx: ProbeContext) -> u32 {
+    info!(&ctx, "uprobe_create called");
     match try_uprobe_handler(ctx, EventType::Create) {
         Ok(ret) => ret,
         Err(ret) => ret,
@@ -43,6 +46,7 @@ pub fn uprobe_create(ctx: ProbeContext) -> u32 {
 
 #[uprobe]
 pub fn uprobe_rename(ctx: ProbeContext) -> u32 {
+    info!(&ctx, "uprobe_rename called");
     match try_uprobe_handler(ctx, EventType::Rename) {
         Ok(ret) => ret,
         Err(ret) => ret,
