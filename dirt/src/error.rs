@@ -18,6 +18,9 @@ pub enum ShfsError {
     #[error("executable segment not found in ELF file")]
     ExecSegmentNotFound,
 
+    #[error("section '{name}' not found in ELF file")]
+    SectionNotFound { name: String },
+
     #[error("address {addr:#x} is not in a loadable segment")]
     AddressNotLoadable { addr: u64 },
 
