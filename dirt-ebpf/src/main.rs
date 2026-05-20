@@ -166,7 +166,9 @@ fn try_uretprobe_handler(ctx: RetProbeContext) -> Result<u32, u32> {
                 tgt_whitelisted = (*(&raw mut WHITELIST)).get(&*share_name_buf).is_some();
             }
 
-            if src_whitelisted || tgt_whitelisted {
+            if src_whitelisted {
+                let _ = (*(&raw mut EVENTS)).output(&*event, 0);
+            } else if tgt_whitelisted {
                 let _ = (*(&raw mut EVENTS)).output(&*event, 0);
             }
         }
