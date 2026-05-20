@@ -194,20 +194,48 @@ impl<'a> ShfsAnalysis<'a> {
         // Virtual address to index in the .text section's data.
         let ref_index = (ref_vaddr - self.text_section.sh_addr) as usize;
 
-        // Pattern for `push rbp; mov rbp, rsp`
-        let prologue_pattern = [0x55, 0x48, 0x89, 0xe5];
+        // Common x86_64 function prologue patterns.
+        let prologue_patterns: &[&[u8]] = &[
+            &[0x55, 0x48, 0x89, 0xe5],             // push rbp; mov rbp, rsp
+            &[0xf3, 0x0f, 0x1e, 0xfa, 0x55, 0x48, 0x89, 0xe5], // endbr64; push rbp; mov rbp, rsp
+            &[0xf3, 0x0f, 0x1e, 0xfa],             // endbr64
+            &[0x41, 0x56, 0x41, 0x54, 0x55, 0x53], // push r14; push r12; push rbp; push rbx
+            &[0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54], // push r15..r12
+            &[0x55, 0x41, 0x57, 0x41, 0x56],       // push rbp; push r15; push r14
+        ];
 
-        // Search backwards from the string reference for the prologue pattern.
-        // We look at chunks of 4 bytes.
-        for i in (0..ref_index.saturating_sub(prologue_pattern.len() - 1)).rev() {
-            if &text_data[i..i + 4] == prologue_pattern {
-                let prologue_vaddr = self.text_section.sh_addr + i as u64;
-                debug!(
-                    "Found function prologue for ref {:#x} at {:#x}",
-                    ref_vaddr,
-                    prologue_vaddr
-                );
-                return Ok(prologue_vaddr);
+        // Search backwards from the string reference for a known prologue pattern.
+        // We limit the search distance to avoid overshooting into unrelated functions.
+        const MAX_SEARCH_DISTANCE: usize = 8192;
+        let start_search = ref_index.saturating_sub(MAX_SEARCH_DISTANCE);
+
+        for i in (start_search..ref_index).rev() {
+            for pattern in prologue_patterns {
+                if text_data[i..].starts_with(pattern) {
+                    let prologue_vaddr = self.text_section.sh_addr + i as u64;
+                    debug!(
+                        "Found function prologue for ref {:#x} at {:#x} using pattern {:?}",
+                        ref_vaddr, prologue_vaddr, pattern
+                    );
+                    return Ok(prologue_vaddr);
+                }
+            }
+
+            // Secondary heuristic: check for function padding (nop or int3) following a 'ret' (0xc3)
+            // if we are at least 16 bytes away from the reference point.
+            if ref_index - i > 16 && i > 0 && i + 1 < text_data.len() {
+                let prev_byte = text_data[i - 1];
+                let curr_byte = text_data[i];
+                if prev_byte == 0xc3 && (curr_byte == 0x90 || curr_byte == 0xcc || curr_byte == 0x0f) {
+                    // 0x0f 0x1f is part of a multi-byte NOP.
+                    // We found a likely function boundary.
+                    let prologue_vaddr = self.text_section.sh_addr + i as u64;
+                    debug!(
+                        "Found likely function boundary for ref {:#x} at {:#x} via padding heuristic",
+                        ref_vaddr, prologue_vaddr
+                    );
+                    return Ok(prologue_vaddr);
+                }
             }
         }
 
