@@ -1,7 +1,7 @@
 use crate::error::ShfsError;
 use elf::endian::AnyEndian;
 use elf::ElfBytes;
-use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, Register};
+use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter};
 use log::{debug, trace};
 use std::collections::HashMap;
 use std::fs;
@@ -52,11 +52,12 @@ impl<'a> ShfsAnalysis<'a> {
 
     /// Finds the virtual address of a function's string identifier.
     fn find_string_vaddr(&self, func_name: &str) -> Result<u64, ShfsError> {
-        let rodata = self.elf.section_header_by_name(".rodata")?.ok_or(
-            ShfsError::StringNotFound {
-                name: func_name.to_string(),
-            },
-        )?;
+        let rodata = self
+            .elf
+            .section_header_by_name(".rodata")?
+            .ok_or_else(|| ShfsError::SectionNotFound {
+                name: ".rodata".to_string(),
+            })?;
 
         let (data, _) = self.elf.section_data(&rodata)?;
         let cstr_name = std::ffi::CString::new(func_name).unwrap();
@@ -134,46 +135,105 @@ impl<'a> ShfsAnalysis<'a> {
             .section_data(&self.text_section)
             .map_err(ShfsError::ElfParseError)?;
 
-        // We only need to decode instructions up to the reference address.
         let ref_offset_in_text = (ref_vaddr - self.text_section.sh_addr) as usize;
-        let data_to_decode = &text_data
-            .get(..ref_offset_in_text)
-            .ok_or_else(|| ShfsError::PrologueNotFound { name: format!("{:#x}", ref_vaddr) })?;
+
+        // Search backwards for common prologue patterns or padding.
+        // We limit the search distance to 4096 bytes.
+        let search_start = ref_offset_in_text.saturating_sub(4096);
+        let data_to_search = &text_data[search_start..ref_offset_in_text];
+
+        for i in (0..data_to_search.len()).rev() {
+            let current_vaddr = self.text_section.sh_addr + search_start as u64 + i as u64;
+
+            // Pattern 1: `endbr64` (f3 0f 1e fa)
+            if data_to_search[i..].starts_with(&[0xf3, 0x0f, 0x1e, 0xfa]) {
+                debug!("Found endbr64 at {:#x}", current_vaddr);
+                return Ok(current_vaddr);
+            }
+
+            // Pattern 2: `push rbp; mov rbp, rsp` (55 48 89 e5)
+            if data_to_search[i..].starts_with(&[0x55, 0x48, 0x89, 0xe5]) {
+                debug!("Found push rbp; mov rbp, rsp at {:#x}", current_vaddr);
+                return Ok(current_vaddr);
+            }
+
+            // Pattern 3: `push rbp` followed by something that isn't `mov rbp, rsp`
+            // and preceded by padding (ret + nop/int3).
+            if data_to_search[i] == 0x55 && i > 0 {
+                let prev_byte = data_to_search[i - 1];
+                if prev_byte == 0x90 || prev_byte == 0xcc || prev_byte == 0xc3 {
+                    debug!("Found possible push rbp at {:#x} after padding", current_vaddr);
+                    return Ok(current_vaddr);
+                }
+            }
+
+            // Pattern 4: Register push sequence (push r14; push r12; push rbp; push rbx)
+            if data_to_search[i..].starts_with(&[0x41, 0x56, 0x41, 0x54, 0x55, 0x53]) {
+                debug!("Found register push sequence at {:#x}", current_vaddr);
+                return Ok(current_vaddr);
+            }
+
+            // Pattern 5: Any instruction after padding (ret followed by nops or int3)
+            if i > 0 && (data_to_search[i - 1] == 0x90 || data_to_search[i - 1] == 0xcc) {
+                // If current byte is not padding, but previous was, we might be at function start.
+                if data_to_search[i] != 0x90 && data_to_search[i] != 0xcc {
+                    // Check if we have a sequence of nops/int3 and then a ret/jmp before that.
+                    let mut j = i - 1;
+                    while j > 0 && (data_to_search[j] == 0x90 || data_to_search[j] == 0xcc) {
+                        j -= 1;
+                    }
+                    if data_to_search[j] == 0xc3 || data_to_search[j] == 0xc2 {
+                        debug!("Found function start after padding at {:#x}", current_vaddr);
+                        return Ok(current_vaddr);
+                    }
+                }
+            }
+        }
+
+        Err(ShfsError::PrologueNotFound {
+            name: format!("{:#x}", ref_vaddr),
+        })
+    }
+
+    /// Verifies and logs the instructions at a function's starting virtual address.
+    fn verify_function(&self, func_name: &str, vaddr: u64) -> Result<(), ShfsError> {
+        let (text_data, _) = self
+            .elf
+            .section_data(&self.text_section)
+            .map_err(ShfsError::ElfParseError)?;
+
+        let offset_in_text = (vaddr - self.text_section.sh_addr) as usize;
+        let data_to_decode = &text_data[offset_in_text..];
 
         let mut decoder = Decoder::new(64, data_to_decode, DecoderOptions::AMD);
-        decoder.set_ip(self.text_section.sh_addr);
+        decoder.set_ip(vaddr);
 
-        let instructions: Vec<Instruction> = decoder.iter().collect();
+        let mut formatter = IntelFormatter::new();
+        let mut output = String::new();
 
-        if let Some(prologue_window) = instructions.windows(2).rev().find(|window| {
-            let push_ins = &window[0];
-            let mov_ins = &window[1];
+        debug!("Verification of function: {}", func_name);
+        for instruction in decoder.into_iter().take(10) {
+            output.clear();
+            formatter.format(&instruction, &mut output);
 
-            // Check for `push rbp`
-            let is_push_rbp = push_ins.mnemonic() == Mnemonic::Push
-                && push_ins.op_count() == 1
-                && push_ins.op0_register() == Register::RBP;
+            let start_index = (instruction.ip() - vaddr) as usize;
+            let instr_bytes = &data_to_decode[start_index..start_index + instruction.len()];
 
-            // Check for `mov rbp, rsp`
-            let is_mov_rbp_rsp = mov_ins.mnemonic() == Mnemonic::Mov
-                && mov_ins.op_count() == 2
-                && mov_ins.op0_register() == Register::RBP
-                && mov_ins.op1_register() == Register::RSP;
+            let mut hex_bytes = String::new();
+            for b in instr_bytes {
+                hex_bytes.push_str(&format!("{:02x} ", b));
+            }
 
-            is_push_rbp && is_mov_rbp_rsp
-        }) {
-            let prologue_start_ins = &prologue_window[0];
             debug!(
-                "Found function prologue for ref {:#x} at {:#x}",
-                ref_vaddr,
-                prologue_start_ins.ip()
+                "{}: {:#018x} {:<20} {}",
+                func_name,
+                instruction.ip(),
+                hex_bytes,
+                output
             );
-            Ok(prologue_start_ins.ip())
-        } else {
-            Err(ShfsError::PrologueNotFound {
-                name: format!("{:#x}", ref_vaddr),
-            })
         }
+
+        Ok(())
     }
 }
 
@@ -208,6 +268,8 @@ pub fn get_function_offsets(
 
         let func_vaddr = analysis.find_function_prologue_vaddr(ref_vaddr)?;
         debug!("Function start virtual address: {:#x}", func_vaddr);
+
+        analysis.verify_function(func_name, func_vaddr)?;
 
         let func_offset = analysis.vaddr_to_offset(func_vaddr)?;
         debug!("Function file offset: {:#x}", func_offset);
