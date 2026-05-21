@@ -73,8 +73,9 @@ impl<'a> ShfsAnalysis<'a> {
         Ok(rodata.sh_addr + string_relative_offset)
     }
 
-    /// Finds the first reference to a virtual address in the .text section.
-    fn find_string_ref_vaddr(&self, string_vaddr: u64) -> Result<u64, ShfsError> {
+    /// Finds references to a virtual address in the .text section.
+    fn find_string_refs_vaddr(&self, string_vaddr: u64) -> Result<Vec<u64>, ShfsError> {
+        let mut refs = Vec::new();
         let (text_data, _) = self
             .elf
             .section_data(&self.text_section)
@@ -92,7 +93,7 @@ impl<'a> ShfsAnalysis<'a> {
             if instruction.is_ip_rel_memory_operand() {
                 if instruction.ip_rel_memory_address() == string_vaddr {
                     debug!("Found IP-relative reference to {:#x} at {:#x}", string_vaddr, instruction.ip());
-                    return Ok(instruction.ip());
+                    refs.push(instruction.ip());
                 }
             }
 
@@ -106,7 +107,7 @@ impl<'a> ShfsAnalysis<'a> {
                    instruction.memory_index() == iced_x86::Register::None {
                     if instruction.memory_displacement64() == string_vaddr {
                         debug!("Found absolute memory reference to {:#x} at {:#x}", string_vaddr, instruction.ip());
-                        return Ok(instruction.ip());
+                        refs.push(instruction.ip());
                     }
                 }
 
@@ -114,18 +115,22 @@ impl<'a> ShfsAnalysis<'a> {
                 match op_kind {
                     iced_x86::OpKind::Immediate64 if instruction.immediate64() == string_vaddr => {
                         debug!("Found immediate reference to {:#x} at {:#x}", string_vaddr, instruction.ip());
-                        return Ok(instruction.ip());
+                        refs.push(instruction.ip());
                     }
                     iced_x86::OpKind::Immediate32 if instruction.immediate32() as u64 == string_vaddr => {
                         debug!("Found immediate reference to {:#x} at {:#x}", string_vaddr, instruction.ip());
-                        return Ok(instruction.ip());
+                        refs.push(instruction.ip());
                     }
                     _ => {}
                 }
             }
         }
 
-        Err(ShfsError::StringRefNotFound { name: format!("{:#x}", string_vaddr) })
+        if refs.is_empty() {
+            Err(ShfsError::StringRefNotFound { name: format!("{:#x}", string_vaddr) })
+        } else {
+            Ok(refs)
+        }
     }
 
     /// Searches backwards from a reference address to find the function prologue.
@@ -167,9 +172,27 @@ impl<'a> ShfsAnalysis<'a> {
                 }
             }
 
-            // Pattern 4: Register push sequence (push r14; push r12; push rbp; push rbx)
-            if data_to_search[i..].starts_with(&[0x41, 0x56, 0x41, 0x54, 0x55, 0x53]) {
-                debug!("Found register push sequence at {:#x}", current_vaddr);
+            // Pattern 4: Register push sequence (push r15; push r14; push r13; push r12; push rbp; push rbx; push rdi; push rsi)
+            // Common in optimized functions without frame pointers.
+            // We look for a sequence of at least 2 pushes.
+            let mut pushes = 0;
+            let mut j = i;
+            while j < data_to_search.len() {
+                let b = data_to_search[j];
+                if (0x50..=0x57).contains(&b) || (0x40..=0x4f).contains(&b) && (0x50..=0x57).contains(data_to_search.get(j+1).unwrap_or(&0)) {
+                    if (0x50..=0x57).contains(&b) {
+                        pushes += 1;
+                        j += 1;
+                    } else {
+                        pushes += 1;
+                        j += 2;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if pushes >= 2 {
+                debug!("Found register push sequence ({} pushes) at {:#x}", pushes, current_vaddr);
                 return Ok(current_vaddr);
             }
 
@@ -177,16 +200,25 @@ impl<'a> ShfsAnalysis<'a> {
             if i > 0 && (data_to_search[i - 1] == 0x90 || data_to_search[i - 1] == 0xcc) {
                 // If current byte is not padding, but previous was, we might be at function start.
                 if data_to_search[i] != 0x90 && data_to_search[i] != 0xcc {
-                    // Check if we have a sequence of nops/int3 and then a ret/jmp before that.
+                    // Check if we have a sequence of nops/int3.
                     let mut j = i - 1;
+                    let mut padding_len = 0;
                     while j > 0 && (data_to_search[j] == 0x90 || data_to_search[j] == 0xcc) {
                         j -= 1;
+                        padding_len += 1;
                     }
-                    if data_to_search[j] == 0xc3 || data_to_search[j] == 0xc2 {
-                        debug!("Found function start after padding at {:#x}", current_vaddr);
+                    // If we have substantial padding, or padding after a return.
+                    if data_to_search[j] == 0xc3 || data_to_search[j] == 0xc2 || padding_len >= 4 {
+                        debug!("Found function start after padding (len {}) at {:#x}", padding_len, current_vaddr);
                         return Ok(current_vaddr);
                     }
                 }
+            }
+
+            // Pattern 6: Stack allocation (sub rsp, imm)
+            if data_to_search[i..].starts_with(&[0x48, 0x83, 0xec]) || data_to_search[i..].starts_with(&[0x48, 0x81, 0xec]) {
+                 debug!("Found stack allocation at {:#x}", current_vaddr);
+                 return Ok(current_vaddr);
             }
         }
 
@@ -212,7 +244,7 @@ impl<'a> ShfsAnalysis<'a> {
         let mut output = String::new();
 
         debug!("Verification of function: {}", func_name);
-        for instruction in decoder.into_iter().take(10) {
+        for instruction in decoder.into_iter().take(20) {
             output.clear();
             formatter.format(&instruction, &mut output);
 
@@ -255,7 +287,7 @@ pub fn get_function_offsets(
     })?;
 
     let analysis = ShfsAnalysis::new(&file_bytes)?;
-    let mut offsets = HashMap::new();
+    let mut offsets: HashMap<String, u64> = HashMap::new();
 
     for &func_name in functions {
         debug!("Searching for function: {}", func_name);
@@ -263,10 +295,54 @@ pub fn get_function_offsets(
         let string_vaddr = analysis.find_string_vaddr(func_name)?;
         debug!("String virtual address: {:#x}", string_vaddr);
 
-        let ref_vaddr = analysis.find_string_ref_vaddr(string_vaddr)?;
-        trace!("Found reference to string at vaddr: {:#x}", ref_vaddr);
+        let ref_vaddrs = analysis.find_string_refs_vaddr(string_vaddr)?;
+        let mut candidates = Vec::new();
 
-        let func_vaddr = analysis.find_function_prologue_vaddr(ref_vaddr)?;
+        for ref_vaddr in ref_vaddrs {
+            trace!("Checking reference to string at vaddr: {:#x}", ref_vaddr);
+            if let Ok(func_vaddr) = analysis.find_function_prologue_vaddr(ref_vaddr) {
+                let distance = ref_vaddr - func_vaddr;
+                candidates.push((func_vaddr, distance, ref_vaddr));
+            }
+        }
+
+        // Sort candidates by distance from the reference to the prologue.
+        // We assume the closest prologue is the most likely start of the function.
+        candidates.sort_by_key(|&(_, distance, _)| distance);
+
+        let mut found_vaddr = None;
+        for (func_vaddr, distance, ref_vaddr) in candidates {
+            let current_offset = analysis.vaddr_to_offset(func_vaddr).unwrap_or(0);
+            debug!(
+                "Candidate for {}: vaddr={:#x}, offset={:#x}, distance={}, ref={:#x}",
+                func_name, func_vaddr, current_offset, distance, ref_vaddr
+            );
+
+            // Check for collisions with already identified functions.
+            let mut collision_name = None;
+            for (name, &offset) in &offsets {
+                if offset == current_offset {
+                    collision_name = Some(name.clone());
+                    break;
+                }
+            }
+
+            if let Some(other_name) = collision_name {
+                debug!(
+                    "Collision: {} and {} share offset {:#x}. Skipping.",
+                    func_name, other_name, current_offset
+                );
+                continue;
+            }
+
+            found_vaddr = Some(func_vaddr);
+            break;
+        }
+
+        let func_vaddr = found_vaddr.ok_or_else(|| ShfsError::PrologueNotFound {
+            name: func_name.to_string(),
+        })?;
+
         debug!("Function start virtual address: {:#x}", func_vaddr);
 
         analysis.verify_function(func_name, func_vaddr)?;
