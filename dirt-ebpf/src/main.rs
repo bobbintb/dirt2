@@ -143,35 +143,39 @@ fn try_uretprobe_handler(ctx: RetProbeContext) -> Result<u32, u32> {
     let pid_tgid = bpf_get_current_pid_tgid();
     let event_ptr = unsafe { (*(&raw mut CALLS)).get(&pid_tgid) };
 
-    // Always remove the entry from the map
-    unsafe {
-        let _ = (*(&raw mut CALLS)).remove(&pid_tgid);
-    }
-
-    let event = event_ptr.ok_or(1u32)?;
-    let ret = ctx.ret::<i32>().ok_or(1u32)?;
+    let event = event_ptr.ok_or_else(|| {
+        unsafe { let _ = (*(&raw mut CALLS)).remove(&pid_tgid); }
+        1u32
+    })?;
+    let ret = ctx.ret::<i32>().ok_or_else(|| {
+        unsafe { let _ = (*(&raw mut CALLS)).remove(&pid_tgid); }
+        1u32
+    })?;
 
     if ret == 0 {
         unsafe {
-            let share_name_buf = (*(&raw mut SHARE_SCRATCH)).get_ptr_mut(0).ok_or(1u32)?;
+            let share_name_buf = (*(&raw mut SHARE_SCRATCH)).get_ptr_mut(0).ok_or_else(|| {
+                let _ = (*(&raw mut CALLS)).remove(&pid_tgid);
+                1u32
+            })?;
 
             // Check the source path first.
             get_share_name(&(*event).src_path, &mut *share_name_buf)?;
-            let src_whitelisted = (*(&raw mut WHITELIST)).get(&*share_name_buf).is_some();
-
-            // If it's a rename event, check the target path.
-            let mut tgt_whitelisted = false;
-            if matches!((*event).event, EventType::Rename) {
+            if (*(&raw mut WHITELIST)).get(&*share_name_buf).is_some() {
+                let _ = (*(&raw mut EVENTS)).output(&*event, 0);
+            } else if matches!((*event).event, EventType::Rename) {
+                // If it's a rename event, check the target path.
                 get_share_name(&(*event).tgt_path, &mut *share_name_buf)?;
-                tgt_whitelisted = (*(&raw mut WHITELIST)).get(&*share_name_buf).is_some();
-            }
-
-            if src_whitelisted {
-                let _ = (*(&raw mut EVENTS)).output(&*event, 0);
-            } else if tgt_whitelisted {
-                let _ = (*(&raw mut EVENTS)).output(&*event, 0);
+                if (*(&raw mut WHITELIST)).get(&*share_name_buf).is_some() {
+                    let _ = (*(&raw mut EVENTS)).output(&*event, 0);
+                }
             }
         }
+    }
+
+    // Always remove the entry from the map after processing
+    unsafe {
+        let _ = (*(&raw mut CALLS)).remove(&pid_tgid);
     }
 
     Ok(0)
